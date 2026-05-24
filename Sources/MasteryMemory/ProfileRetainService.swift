@@ -40,24 +40,25 @@ public actor ProfileRetainService {
     /// Call this once the extraction LLM has produced an ExtractionPackage.
     /// Writes every non-empty layer to Hindsight. Throws on the first network failure.
     public func persist(_ package: ExtractionPackage) async throws {
-        let userId    = package.metadata.userId
-        let sessionId = package.metadata.sessionId
-        let bankId    = userId
+        let userId           = package.metadata.userId
+        let sessionId        = package.metadata.sessionId
+        let bankId           = userId
+        let sessionTimestamp = package.metadata.timestampStart
 
         var items: [RetainItem] = []
 
         // Layer 1 — Bio
         if let updates = package.bioUpdates {
-            items += bioItems(updates, userId: userId, sessionId: sessionId)
+            items += bioItems(updates, userId: userId, sessionId: sessionId, timestamp: sessionTimestamp)
         }
 
         // Layer 2 — 21 Dimensions
         if let updates = package.dimensionUpdates {
-            items += dimensionItems(updates, userId: userId, sessionId: sessionId)
+            items += dimensionItems(updates, userId: userId, sessionId: sessionId, timestamp: sessionTimestamp)
         }
 
         // Layer 3 — Session Brief (always present)
-        items += briefItems(package.sessionBrief, sessionId: sessionId)
+        items += briefItems(package.sessionBrief, sessionId: sessionId, timestamp: sessionTimestamp)
 
         // Layer 4 — Timeline
         if let events = package.timelineEvents {
@@ -67,31 +68,32 @@ public actor ProfileRetainService {
 
         // Layer 5 — Signal Flags
         if let flags = package.signalFlags {
-            items += signalFlagItems(flags, sessionId: sessionId)
+            items += signalFlagItems(flags, sessionId: sessionId, timestamp: sessionTimestamp)
         }
 
         // Layer 6 — Coach's Journal (always present)
-        items.append(journalItem(package.coachesJournal, userId: userId, sessionId: sessionId))
+        items.append(journalItem(package.coachesJournal, userId: userId, sessionId: sessionId, timestamp: sessionTimestamp))
 
         // Layer 7 — Program State
         if let state = package.programStateUpdate {
-            items += programStateItems(state, userId: userId, sessionId: sessionId)
+            items += programStateItems(state, userId: userId, sessionId: sessionId, timestamp: sessionTimestamp)
         }
 
         // Layer 8 — Management System
         if let mgmt = package.managementUpdates {
-            items += managementItems(mgmt, userId: userId, sessionId: sessionId)
+            items += managementItems(mgmt, userId: userId, sessionId: sessionId, timestamp: sessionTimestamp)
         }
 
-        // Batch in chunks of 50 to stay within payload limits
+        // Batch in chunks of 50; use async so the HTTP call returns immediately
+        // while Hindsight indexes in the background (post-session write path).
         for batch in items.chunked(into: 50) {
-            _ = try await client.retain(bankId: bankId, items: batch)
+            _ = try await client.retain(bankId: bankId, items: batch, async: true)
         }
     }
 
     // MARK: - Layer 1: Bio
 
-    private func bioItems(_ updates: [BioUpdate], userId: String, sessionId: String) -> [RetainItem] {
+    private func bioItems(_ updates: [BioUpdate], userId: String, sessionId: String, timestamp: String) -> [RetainItem] {
         updates.map { update in
             let doc = """
             Category: \(update.category.rawValue)
@@ -104,6 +106,7 @@ public actor ProfileRetainService {
             return RetainItem(
                 content: doc,
                 context: "Biographical fact extracted from session \(sessionId). Confidence: \(update.confidence.rawValue).",
+                timestamp: timestamp,
                 documentId: "bio:\(userId):\(update.category.rawValue)",
                 updateMode: "replace",
                 tags: ["layer:bio", "session:\(sessionId)", "bio-category:\(update.category.rawValue)"],
@@ -114,7 +117,7 @@ public actor ProfileRetainService {
 
     // MARK: - Layer 2: 21 Dimensions
 
-    private func dimensionItems(_ updates: [DimensionUpdate], userId: String, sessionId: String) -> [RetainItem] {
+    private func dimensionItems(_ updates: [DimensionUpdate], userId: String, sessionId: String, timestamp: String) -> [RetainItem] {
         updates.map { update in
             let doc = """
             Dimension \(update.dimensionNumber): \(update.dimensionName)
@@ -129,6 +132,7 @@ public actor ProfileRetainService {
             return RetainItem(
                 content: doc,
                 context: "Profile dimension signal from session \(sessionId). Direction '\(update.direction.rawValue)' means: \(directionExplanation(update.direction)).",
+                timestamp: timestamp,
                 documentId: "dim:\(userId):\(update.dimensionNumber)",
                 updateMode: "replace",
                 tags: [
@@ -138,12 +142,12 @@ public actor ProfileRetainService {
                     "session:\(sessionId)"
                 ],
                 metadata: [
-                    "user_id":         userId,
-                    "session_id":      sessionId,
+                    "user_id":          userId,
+                    "session_id":       sessionId,
                     "dimension_number": String(update.dimensionNumber),
-                    "dimension_name":  update.dimensionName,
-                    "direction":       update.direction.rawValue,
-                    "weight":          update.weight.rawValue
+                    "dimension_name":   update.dimensionName,
+                    "direction":        update.direction.rawValue,
+                    "weight":           update.weight.rawValue
                 ]
             )
         }
@@ -160,10 +164,9 @@ public actor ProfileRetainService {
 
     // MARK: - Layer 3: Session Brief
 
-    private func briefItems(_ brief: SessionBrief, sessionId: String) -> [RetainItem] {
+    private func briefItems(_ brief: SessionBrief, sessionId: String, timestamp: String) -> [RetainItem] {
         var items: [RetainItem] = []
 
-        // Main brief — immutable, written once per session
         let doc = """
         Summary: \(brief.summary)
 
@@ -175,13 +178,13 @@ public actor ProfileRetainService {
         items.append(RetainItem(
             content: doc,
             context: "Session brief for \(sessionId). Captures the emotional arc and key themes.",
+            timestamp: timestamp,
             documentId: "brief:\(sessionId)",
             updateMode: "replace",
             tags: ["layer:sessions", "session:\(sessionId)"],
             metadata: ["session_id": sessionId]
         ))
 
-        // Open threads — append to a rolling list so history is preserved
         if let threads = brief.openThreads, !threads.isEmpty {
             let threadDoc = threads.map { t in
                 "[\(t.priority.rawValue)] \(t.thread)"
@@ -189,6 +192,7 @@ public actor ProfileRetainService {
             items.append(RetainItem(
                 content: threadDoc,
                 context: "Open coaching threads from session \(sessionId). Priority codes: follow_up_next_session > monitor > park.",
+                timestamp: timestamp,
                 documentId: "threads:\(sessionId)",
                 updateMode: "replace",
                 tags: ["layer:sessions", "open-threads", "session:\(sessionId)"],
@@ -196,7 +200,6 @@ public actor ProfileRetainService {
             ))
         }
 
-        // Commitments
         if let commitments = brief.commitments, !commitments.isEmpty {
             let commitDoc = commitments.map { c in
                 c.timeframe.map { "• \(c.commitment) (by \($0))" } ?? "• \(c.commitment)"
@@ -204,6 +207,7 @@ public actor ProfileRetainService {
             items.append(RetainItem(
                 content: commitDoc,
                 context: "Commitments made by the person in session \(sessionId).",
+                timestamp: timestamp,
                 documentId: "commitments:\(sessionId)",
                 updateMode: "replace",
                 tags: ["layer:sessions", "commitments", "session:\(sessionId)"],
@@ -211,7 +215,6 @@ public actor ProfileRetainService {
             ))
         }
 
-        // Practice responses
         if let responses = brief.practiceResponses, !responses.isEmpty {
             let responseDoc = responses.map { r in
                 let name = r.practiceName.map { " (\($0))" } ?? ""
@@ -220,6 +223,7 @@ public actor ProfileRetainService {
             items.append(RetainItem(
                 content: responseDoc,
                 context: "How the person responded to practices in session \(sessionId).",
+                timestamp: timestamp,
                 documentId: "practice-responses:\(sessionId)",
                 updateMode: "replace",
                 tags: ["layer:sessions", "practices", "session:\(sessionId)"],
@@ -280,7 +284,7 @@ public actor ProfileRetainService {
 
     // MARK: - Layer 5: Signal Flags
 
-    private func signalFlagItems(_ flags: [SignalFlag], sessionId: String) -> [RetainItem] {
+    private func signalFlagItems(_ flags: [SignalFlag], sessionId: String, timestamp: String) -> [RetainItem] {
         flags.enumerated().map { (index, flag) in
             let doc = """
             Flag: \(flag.flagType.rawValue)
@@ -293,6 +297,7 @@ public actor ProfileRetainService {
             return RetainItem(
                 content: doc,
                 context: "Signal flag from session \(sessionId). Severity '\(flag.severity.rawValue)': \(severityNote(flag.severity)).",
+                timestamp: timestamp,
                 documentId: "flag:\(sessionId):\(index)",
                 updateMode: "replace",
                 tags: [
@@ -320,7 +325,7 @@ public actor ProfileRetainService {
 
     // MARK: - Layer 6: Coach's Journal
 
-    private func journalItem(_ journal: CoachesJournal, userId: String, sessionId: String) -> RetainItem {
+    private func journalItem(_ journal: CoachesJournal, userId: String, sessionId: String, timestamp: String) -> RetainItem {
         let dims = journal.dimensionsTagged.map(String.init).joined(separator: ",")
         let doc = """
         \(journal.entry)
@@ -333,6 +338,7 @@ public actor ProfileRetainService {
         return RetainItem(
             content: doc,
             context: "Coach's Journal entry — written in coach's voice, visible to the person. Session \(sessionId).",
+            timestamp: timestamp,
             documentId: "journal:\(userId):latest",
             updateMode: "replace",
             tags: tags,
@@ -342,17 +348,14 @@ public actor ProfileRetainService {
 
     // MARK: - Layer 7: Program State
 
-    private func programStateItems(_ state: ProgramStateUpdate, userId: String, sessionId: String) -> [RetainItem] {
+    private func programStateItems(_ state: ProgramStateUpdate, userId: String, sessionId: String, timestamp: String) -> [RetainItem] {
         var items: [RetainItem] = []
 
         var parts: [String] = []
         if let progress = state.skillProgress {
-            parts.append("""
-            Skill: \(progress.skillName)
-            Phase before: \(progress.phaseBefore)
-            Phase after:  \(progress.phaseAfter)
-            \(progress.notes.map { "Notes: \($0)" } ?? "")
-            """)
+            var block = "Skill: \(progress.skillName)\nPhase before: \(progress.phaseBefore)\nPhase after:  \(progress.phaseAfter)"
+            if let notes = progress.notes { block += "\nNotes: \(notes)" }
+            parts.append(block)
         }
         if let prescribed = state.practicesPrescribed, !prescribed.isEmpty {
             parts.append("Practices prescribed:\n" + prescribed.map { "• \($0)" }.joined(separator: "\n"))
@@ -365,6 +368,7 @@ public actor ProfileRetainService {
             items.append(RetainItem(
                 content: parts.joined(separator: "\n\n"),
                 context: "Program state after session \(sessionId). Tracks skill progression through the 12-skill arc.",
+                timestamp: timestamp,
                 documentId: "program:\(userId)",
                 updateMode: "replace",
                 tags: ["layer:program", "session:\(sessionId)"],
@@ -377,7 +381,7 @@ public actor ProfileRetainService {
 
     // MARK: - Layer 8: Management System
 
-    private func managementItems(_ updates: ManagementUpdates, userId: String, sessionId: String) -> [RetainItem] {
+    private func managementItems(_ updates: ManagementUpdates, userId: String, sessionId: String, timestamp: String) -> [RetainItem] {
         var items: [RetainItem] = []
 
         if let goals = updates.goals, !goals.isEmpty {
@@ -385,6 +389,7 @@ public actor ProfileRetainService {
             items.append(RetainItem(
                 content: doc,
                 context: "Goals management updates from session \(sessionId).",
+                timestamp: timestamp,
                 documentId: "mgmt-goals:\(userId)",
                 updateMode: "replace",
                 tags: ["layer:management", "mgmt:goals", "session:\(sessionId)"],
@@ -397,6 +402,7 @@ public actor ProfileRetainService {
             items.append(RetainItem(
                 content: doc,
                 context: "Habits management updates from session \(sessionId).",
+                timestamp: timestamp,
                 documentId: "mgmt-habits:\(userId)",
                 updateMode: "replace",
                 tags: ["layer:management", "mgmt:habits", "session:\(sessionId)"],
@@ -409,6 +415,7 @@ public actor ProfileRetainService {
             items.append(RetainItem(
                 content: doc,
                 context: "To-dos management updates from session \(sessionId).",
+                timestamp: timestamp,
                 documentId: "mgmt-todos:\(userId)",
                 updateMode: "replace",
                 tags: ["layer:management", "mgmt:todos", "session:\(sessionId)"],

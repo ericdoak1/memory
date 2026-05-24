@@ -13,15 +13,48 @@ import Foundation
 // Safe to call from any Swift concurrency context.
 
 public final class LivingProfileService: Sendable {
+    private let client: HindsightClient
     private let retain: ProfileRetainService
     private let recall: ProfileRecallService
     public  let userId: String
 
     public init(config: HindsightConfig, userId: String) {
         let client   = HindsightClient(config: config)
+        self.client  = client
         self.retain  = ProfileRetainService(client: client)
         self.recall  = ProfileRecallService(client: client)
         self.userId  = userId
+    }
+
+    // MARK: - Bank setup
+
+    /// Configure the Hindsight bank with coaching-appropriate missions and disposition.
+    /// Call once at account creation or app startup — idempotent, safe to re-run.
+    public func setup() async throws {
+        let bankConfig = CreateBankRequest(
+            retainMission: """
+            Extract psychological signals, emotional states, personal history, athletic experiences, \
+            relationships, goals, fears, self-belief, and performance patterns. \
+            Capture exact quotes when the person describes their inner experience. \
+            Ignore scheduling logistics, session administration, and filler phrases.
+            """,
+            observationsMission: """
+            Synthesise durable psychological patterns across the 21 profile dimensions: \
+            identity, self-belief, fear, motivation, resilience, relationships, and craft. \
+            Track shifts, contradictions, breakthroughs, and deepening signals. \
+            Ignore one-off states — focus on recurring patterns with evidence across multiple sessions.
+            """,
+            reflectMission: """
+            You are an expert mental performance coach with deep knowledge of human psychology, \
+            athlete development, and the Inner Excellence framework. \
+            Always reference the person's specific history, language, and patterns. \
+            Be direct, warm, and evidence-grounded. Never speculate beyond what the profile supports.
+            """,
+            dispositionSkepticism: 2,
+            dispositionLiteralism: 2,
+            dispositionEmpathy: 5
+        )
+        try await client.configureBank(bankId: userId, config: bankConfig)
     }
 
     // MARK: - Write path
